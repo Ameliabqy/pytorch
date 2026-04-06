@@ -306,6 +306,97 @@ class TestMaxAutotuneBlackwell(TestCase):
 
 
 @instantiate_parametrized_tests
+class TestBlackwellTMAStoreFusion(TestCase):
+    """Tests for TMA store with fused pointwise epilogues on Blackwell."""
+
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @parametrize("tma_store", (False, True))
+    @parametrize("epilogue_subtile", (1, 2))
+    def test_blackwell_mm_sigmoid_epilogue_fusion_tma_store(
+        self,
+        tma_store: bool,
+        epilogue_subtile: int,
+    ):
+        """Verify fused mm + sigmoid epilogue with TMA store produces correct results."""
+
+        def fn(x, W):
+            mm = torch.mm(x, W.T)
+            return x * (2.0 * torch.sigmoid(mm))
+
+        M, N, K = 256, 128, 128
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=GPU_TYPE)
+        W = torch.randn(N, K, dtype=torch.bfloat16, device=GPU_TYPE)
+
+        epilogue_subtile_regex = f"EPILOGUE_SUBTILE={epilogue_subtile}"
+        with config.patch(
+            {
+                "max_autotune": True,
+                "triton.enable_persistent_tma_matmul": True,
+                "triton.enable_template_tma_store": tma_store,
+                "test_configs.autotune_choice_name_regex": "blackwell_ws_persistent_device_tma",
+                "test_configs.autotune_choice_desc_regex": epilogue_subtile_regex,
+            }
+        ):
+            actual, code = run_and_get_code(torch.compile(fn), x, W)
+            expected = fn(x, W)
+
+        torch.testing.assert_close(actual, expected, atol=1e-1, rtol=1e-1)
+
+        if tma_store:
+            # TMA store path: compute_epilogue assigns to fused_subtile,
+            # then c_desc.store writes via TMA descriptor
+            FileCheck().check("triton_tem_fused_mm").check(
+                "c_desc.store"
+            ).run(code[0])
+            # Should NOT have tl.store for the output
+            self.assertNotIn("tl.store(out_ptr", code[0])
+        else:
+            # Non-TMA path: regular tl.store
+            FileCheck().check("triton_tem_fused_mm").check("tl.store").run(code[0])
+
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @parametrize("tma_store", (False, True))
+    def test_blackwell_addmm_relu_epilogue_fusion_tma_store(
+        self,
+        tma_store: bool,
+    ):
+        """Verify fused addmm + relu epilogue with TMA store."""
+
+        def fn(x, W, bias):
+            mm = torch.mm(x, W.T)
+            return torch.relu(mm + bias)
+
+        M, N, K = 256, 128, 128
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=GPU_TYPE)
+        W = torch.randn(N, K, dtype=torch.bfloat16, device=GPU_TYPE)
+        bias = torch.randn(N, dtype=torch.bfloat16, device=GPU_TYPE)
+
+        with config.patch(
+            {
+                "max_autotune": True,
+                "triton.enable_persistent_tma_matmul": True,
+                "triton.enable_template_tma_store": tma_store,
+                "test_configs.autotune_choice_name_regex": "blackwell_ws_persistent_device_tma",
+            }
+        ):
+            actual, code = run_and_get_code(torch.compile(fn), x, W, bias)
+            expected = fn(x, W, bias)
+
+        torch.testing.assert_close(actual, expected, atol=1e-1, rtol=1e-1)
+
+        if tma_store:
+            FileCheck().check("triton_tem_fused").check("c_desc.store").run(code[0])
+        else:
+            FileCheck().check("triton_tem_fused").check("tl.store").run(code[0])
+
+
+@instantiate_parametrized_tests
 class TestBlackwellExhaustiveConfigs(TestCase):
     """Tests for exhaustive config generation for Blackwell templates."""
 
