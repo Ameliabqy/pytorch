@@ -533,7 +533,9 @@ class LoopBodyBlock:
         from .index_propagation import IndexPropagation
 
         handler: Any = CountOps(
-            CaptureIndexing(proxy_ops, body, tracer),
+            CaptureIndexing(
+                proxy_ops, body, tracer
+            ),  # pyrefly: ignore[bad-argument-type]
             body.op_counts,
         )
         if config.constant_and_index_propagation:

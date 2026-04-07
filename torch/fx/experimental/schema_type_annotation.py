@@ -5,7 +5,7 @@ from typing import Any
 import torch
 import torch.fx
 from torch._jit_internal import boolean_dispatched
-from torch.fx import Transformer
+from torch.fx import GraphModule, Transformer
 from torch.fx.node import Argument, Target
 from torch.fx.operator_schemas import _torchscript_type_to_python_type
 
@@ -31,7 +31,7 @@ class AnnotateTypesWithSchema(Transformer):
 
     def __init__(
         self,
-        module: torch.nn.Module,
+        module: GraphModule,
         annotate_functionals: bool = True,
         annotate_modules: bool = True,
         annotate_get_attrs: bool = True,
