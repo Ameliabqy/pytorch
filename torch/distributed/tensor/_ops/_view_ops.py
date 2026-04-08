@@ -596,6 +596,54 @@ def propagate_shape_and_sharding(
     return input_tgt_placements, output_placements
 
 
+def propagate_single_dim(
+    placement: Placement,
+    global_input_shape: Shape,
+    rule: DimMap,
+    mesh_dim_size: int,
+    strict_view: bool = False,
+) -> tuple[Placement, Placement]:
+    """Propagate one placement through a view op, independently of other mesh dims.
+
+    This is the single-dim entry point for single-dim sharding strategy.
+    Each mesh dim is processed independently with no cross-mesh-dim state:
+    no progressive local_tensor_shapes division, no strided_shard_claimed_dims,
+    no _expected_split_factor adjustment from earlier mesh dims.
+
+    Returns (input_tgt_placement, output_placement).
+    """
+    input_tgt_placements, output_placements = propagate_shape_and_sharding(
+        input_src_placements=(placement,),
+        global_input_shape=global_input_shape,
+        rule=rule,
+        mesh_sizes=(mesh_dim_size,),
+        strict_view=strict_view,
+    )
+    return input_tgt_placements[0], output_placements[0]
+
+
+class _MetaShim:
+    """Wraps TensorMeta so dim_map lambdas can access .ndim (missing on NamedTuple)."""
+
+    __slots__ = ("shape", "ndim")
+
+    def __init__(self, meta: TensorMeta) -> None:
+        self.shape = meta.shape
+        self.ndim = len(meta.shape)
+
+
+def _smallest_factor(n: int) -> int:
+    """Return smallest prime factor of n. n must be >= 2."""
+    if n % 2 == 0:
+        return 2
+    i = 3
+    while i * i <= n:
+        if n % i == 0:
+            return i
+        i += 2
+    return n
+
+
 class _ViewShardingPropagator:
     """Two-phase sharding propagator for view ops.
 
@@ -643,86 +691,98 @@ class _ViewShardingPropagator:
     # Public API: analyze → rewrite_output_placements
     # ------------------------------------------------------------------
 
-    def analyze(
-        self,
-    ) -> tuple[Sequence[Placement], dict[int, list[int]]]:
-        """Phase 1: walk the DimMap rule, return (input_tgt_placements, input_to_output_tensor_dims)."""
-        input_dims_in_rule = self._input_dims_in_rule(self.rule)
+    @staticmethod
+    def _collect_all_input_dims(cmd: DimSpec) -> list[InputDim]:
+        """Collect all InputDim nodes from a DimSpec tree, regardless of sharding.
 
-        # Default: shardable if the dim appears in the rule. Refined by _analyze_*.
-        for dim in range(len(self.global_input_shape)):
-            self.shard_allowed[dim] = [dim in input_dims_in_rule] * self.mesh_ndim
+        For Split, only split_id==0 returns dims — later split_ids are linked
+        via the root chase in _build_input_to_output_map.
+        """
+        if isinstance(cmd, InputDim):
+            return [cmd]
+        elif isinstance(cmd, Flatten):
+            return [d for d in cmd.input_dims if isinstance(d, InputDim)]
+        elif isinstance(cmd, Split):
+            if cmd.split_id == 0:
+                return _ViewShardingPropagator._collect_all_input_dims(cmd.input_dim)
+            return []
+        else:
+            return []
 
-        # Walk the rule to refine shard_allowed and build input_to_output_tensor_dims.
-        #
-        # Flatten example: view([2, 3, 4], [6, 4])
-        #   rule = (Flatten(InputDim(0), InputDim(1)), InputDim(2))
-        #   output_dim=0 (Flatten): hits the isinstance(cmd, Flatten) branch.
-        #     Maps input dims 0 and 1 to output dim 0.  Result: {0: [0], 1: [0]}
-        #   output_dim=1 (InputDim(2)): hits the len(in_dims) > 0 branch.
-        #     Maps input dim 2 to output dim 1.  Result: {0: [0], 1: [0], 2: [1]}
-        #
-        # Split example: view([6], [2, 3])
-        #   rule = (Split(InputDim(0), (2,3), 0), Split(InputDim(0), (2,3), 1))
-        #   output_dim=0 (split_id=0): hits the len(in_dims) > 0 branch.
-        #     Maps input dim 0 to output dim 0.  Result: {0: [0]}
-        #   output_dim=1 (split_id=1): hits the isinstance(cmd, Split) branch
-        #     because _analyze_split returns [] for split_id>0.  Chases root
-        #     InputDim(0) and appends output dim 1.  Result: {0: [0, 1]}
-        input_to_output_tensor_dims: dict[int, list[int]] = {}
-        for output_dim, cmd in enumerate(self.rule):
-            in_dims = self._analyze_dim(cmd)
+    @staticmethod
+    def _build_input_to_output_map(rule: DimMap) -> dict[int, list[int]]:
+        """Build {input_dim: [output_dims]} from the DimMap rule. Mesh-free.
+
+        This is a purely structural mapping: which input dims participate in
+        which output dims.  No sharding or mesh information is needed.
+
+        Examples:
+          Flatten: view([2, 3, 4], [6, 4])
+            rule = (Flatten(InputDim(0), InputDim(1)), InputDim(2))
+            → {0: [0], 1: [0], 2: [1]}
+
+          Split: view([6], [2, 3])
+            rule = (Split(InputDim(0), (2,3), 0), Split(InputDim(0), (2,3), 1))
+            → {0: [0, 1]}
+
+          Split(Flatten): view([2, 3], [3, 2])
+            rule = (Split(Flatten(InputDim(0), InputDim(1)), (3,2), 0),
+                    Split(Flatten(InputDim(0), InputDim(1)), (3,2), 1))
+            → {0: [0, 1], 1: [0, 1]}
+        """
+        collect = _ViewShardingPropagator._collect_all_input_dims
+        input_to_output: dict[int, list[int]] = {}
+        for output_dim, cmd in enumerate(rule):
+            in_dims = collect(cmd)
             if isinstance(cmd, Flatten):
                 for in_dim in in_dims:
-                    if in_dim.input_dim in input_to_output_tensor_dims:
+                    if in_dim.input_dim in input_to_output:
                         raise AssertionError(
                             f"Input dim {in_dim.input_dim} already mapped to output dims "
-                            f"{input_to_output_tensor_dims[in_dim.input_dim]}"
+                            f"{input_to_output[in_dim.input_dim]}"
                         )
-                    input_to_output_tensor_dims[in_dim.input_dim] = [output_dim]
+                    input_to_output[in_dim.input_dim] = [output_dim]
             elif len(in_dims) > 0:
-                # InputDim (identity), Split(split_id=0), or
-                # Split(Flatten(...), split_id=0) which returns multiple dims.
                 for in_dim in in_dims:
-                    if in_dim.input_dim not in input_to_output_tensor_dims:
-                        input_to_output_tensor_dims[in_dim.input_dim] = [output_dim]
+                    if in_dim.input_dim not in input_to_output:
+                        input_to_output[in_dim.input_dim] = [output_dim]
                     else:
-                        input_to_output_tensor_dims[in_dim.input_dim].append(output_dim)
+                        input_to_output[in_dim.input_dim].append(output_dim)
             elif isinstance(cmd, Split):
-                # Split(split_id>0): _analyze_split returned [], so chase the
-                # root input dim and append this output dim to its existing entry.
-                #
-                # Flatten+Split example: view([2, 3], [3, 2])
-                #   rule = (Split(Flatten(InputDim(0), InputDim(1)), (3,2), 0),
-                #           Split(Flatten(InputDim(0), InputDim(1)), (3,2), 1))
-                #   output_dim=0 (split_id=0): _analyze_split returns all
-                #     sharded InputDims from the inner Flatten.  If only
-                #     InputDim(0) is sharded: {0: [0]}.  If both are sharded:
-                #     {0: [0], 1: [0]}.
-                #   output_dim=1 (split_id=1): chases the root input dim
-                #     used as key by split_id=0 and appends output_dim 1.
-                #     E.g. {0: [0, 1]} (or {0: [0, 1], 1: [0]} if both sharded).
+                # Split(split_id>0): chase root to find an InputDim already
+                # in the map (populated by split_id=0) and append this output_dim.
                 root_spec = cmd.input_dim
                 while isinstance(root_spec, (Flatten, Split)):
                     if isinstance(root_spec, Flatten):
-                        # Find whichever input dim was used as the key by
-                        # split_id=0.  input_dims[0] is not always the key
-                        # because strict-mode _analyze_flatten may return a
-                        # non-first sharded dim (e.g. InputDim(1)).
                         root_spec = next(
                             (
                                 fd
                                 for fd in root_spec.input_dims
                                 if isinstance(fd, InputDim)
-                                and fd.input_dim in input_to_output_tensor_dims
+                                and fd.input_dim in input_to_output
                             ),
                             root_spec.input_dims[0],
                         )
                     else:
                         root_spec = root_spec.input_dim
                 root = root_spec if isinstance(root_spec, InputDim) else None
-                if root is not None and root.input_dim in input_to_output_tensor_dims:
-                    input_to_output_tensor_dims[root.input_dim].append(output_dim)
+                if root is not None and root.input_dim in input_to_output:
+                    input_to_output[root.input_dim].append(output_dim)
+        return input_to_output
+
+    def analyze(
+        self,
+    ) -> tuple[Sequence[Placement], dict[int, list[int]]]:
+        """Phase 1: walk the DimMap rule, return (input_tgt_placements, input_to_output_tensor_dims)."""
+        # Structural mapping — mesh-free, computed once.
+        input_to_output_tensor_dims = self._build_input_to_output_map(self.rule)
+
+        # Shardability analysis — sets self.shard_allowed per (input_dim, mesh_dim).
+        input_dims_in_rule = self._input_dims_in_rule(self.rule)
+        for dim in range(len(self.global_input_shape)):
+            self.shard_allowed[dim] = [dim in input_dims_in_rule] * self.mesh_ndim
+        for _output_dim, cmd in enumerate(self.rule):
+            self._analyze_dim(cmd)
 
         input_tgt_placements: list[Placement] = []
         for mesh_dim, p in enumerate(self.input_src_placements):
@@ -1420,15 +1480,53 @@ def register_op_strategy_map(
         return output_strategy
 
 
-register_op_strategy_map(aten.squeeze.default, torch.squeeze)
+def register_single_dim_view_strategy(
+    aten_op_overload: torch._ops.OpOverload,
+    local_op_name: Callable[..., torch.Tensor],
+    schema_info: RuntimeSchemaInfo | None = None,
+    strict_view: bool = False,
+) -> None:
+    """Register a view op under single-dim strategy using propagate_single_dim.
+
+    For each input dim, computes the output placement by calling
+    propagate_single_dim with a mesh_dim_size that guarantees divisibility
+    (smallest prime factor of the dim size).  The expansion infrastructure
+    handles actual divisibility checking at match time via is_tensor_shardable.
+    """
+    dim_map_fn: Callable[..., DimMap] = dim_maps[local_op_name]
+
+    @register_single_dim_strategy(aten_op_overload, schema_info=schema_info)
+    def view_single_dim(op, args_schema, kwargs_schema):
+        input_meta = cast(TensorMeta, args_schema[0])
+        shimmed_args = (_MetaShim(input_meta), *args_schema[1:])
+        rule = dim_map_fn(*shimmed_args, **kwargs_schema)
+
+        strategies: list[list[Placement | _ShardingPlaceholder]] = []
+        for d in range(len(input_meta.shape)):
+            dim_size = input_meta.shape[d]
+            if dim_size <= 1:
+                continue
+            mesh_dim_size = _smallest_factor(dim_size)
+            inp_tgt, out_plc = propagate_single_dim(
+                Shard(d), tuple(input_meta.shape), rule, mesh_dim_size, strict_view
+            )
+            if isinstance(inp_tgt, (Shard, _StridedShard)):
+                strategies.append([out_plc, inp_tgt])
+        # Partial placements pass through unchanged for view ops.
+        for reduce_op in ("sum", "avg", "max", "min"):
+            strategies.append([Partial(reduce_op), Partial(reduce_op)])
+        return strategies
+
+
+register_single_dim_view_strategy(aten.squeeze.default, torch.squeeze)
 register_op_strategy_map(aten.squeeze_.default, torch.squeeze)
 register_op_strategy_map(
     aten.squeeze_.dim, torch.squeeze, schema_info=RuntimeSchemaInfo(1)
 )
-register_op_strategy_map(
+register_single_dim_view_strategy(
     aten.squeeze.dim, torch.squeeze, schema_info=RuntimeSchemaInfo(1)
 )
-register_op_strategy_map(
+register_single_dim_view_strategy(
     aten.squeeze.dims, torch.squeeze, schema_info=RuntimeSchemaInfo(1)
 )
 register_op_strategy_map(
@@ -1440,12 +1538,12 @@ register_op_strategy_map(
     schema_info=RuntimeSchemaInfo(1),
     strict_view=True,
 )
-register_op_strategy_map(
+register_single_dim_view_strategy(
     aten.view_copy.default,
     Tensor.view,
     schema_info=RuntimeSchemaInfo(1),
 )
-register_op_strategy_map(
+register_single_dim_view_strategy(
     aten.reshape.default, torch.reshape, schema_info=RuntimeSchemaInfo(1)
 )
 register_op_strategy_map(
@@ -1454,22 +1552,22 @@ register_op_strategy_map(
     schema_info=RuntimeSchemaInfo(1),
     strict_view=True,
 )
-register_op_strategy_map(
+register_single_dim_view_strategy(
     aten.unsqueeze.default, torch.unsqueeze, schema_info=RuntimeSchemaInfo(1)
 )
-register_op_strategy_map(
+register_single_dim_view_strategy(
     aten.expand.default, Tensor.expand, schema_info=RuntimeSchemaInfo(1)
 )
-register_op_strategy_map(
+register_single_dim_view_strategy(
     aten.expand_copy.default, Tensor.expand, schema_info=RuntimeSchemaInfo(1)
 )
-register_op_strategy_map(
+register_single_dim_view_strategy(
     aten.permute.default, torch.permute, schema_info=RuntimeSchemaInfo(1)
 )
-register_op_strategy_map(
+register_single_dim_view_strategy(
     aten.repeat.default, Tensor.repeat, schema_info=RuntimeSchemaInfo(1)
 )
-register_op_strategy_map(
+register_single_dim_view_strategy(
     aten.transpose.int, torch.transpose, schema_info=RuntimeSchemaInfo(1)
 )
 
@@ -1491,4 +1589,4 @@ def view_as_complex_single_dim_strategy(op, args_schema, kwargs_schema):
     return strategies
 
 
-register_op_strategy_map(aten.view_as_real.default, torch.view_as_real)
+register_single_dim_view_strategy(aten.view_as_real.default, torch.view_as_real)
