@@ -1841,6 +1841,7 @@ class PreDispatchTorchFunctionMode(TorchFunctionMode):
             torch._functorch.predispatch._vmap_increment_nesting,
             torch._functorch.predispatch._vmap_decrement_nesting,
             torch._functorch.vmap.lazy_load_decompositions,
+            torch._functorch.predispatch._make_dual,
         ]:
             _, proxies, _ = _fetch_proxies_and_all_constant_flag(args, self.tracer)
             out_proxy = self.tracer.create_proxy(

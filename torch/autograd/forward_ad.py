@@ -125,7 +125,9 @@ def make_dual(tensor, tangent, *, level=None):
             f"Expected tangent to be floating point or complex, but got: {tangent.dtype}"
         )
 
-    return torch._VF._make_dual(tensor, tangent, level=level)
+    from torch._functorch.predispatch import _make_dual as _predispatch_make_dual
+
+    return _predispatch_make_dual(tensor, tangent, level=level)
 
 
 class UnpackedDualTensor(NamedTuple):

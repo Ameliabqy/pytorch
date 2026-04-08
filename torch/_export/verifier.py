@@ -246,6 +246,7 @@ class Verifier(metaclass=_VerifierMeta):
                 torch._functorch.predispatch._vmap_increment_nesting,
                 torch._functorch.predispatch._vmap_decrement_nesting,
                 torch._functorch.predispatch.lazy_load_decompositions,
+                torch._functorch.predispatch._make_dual,
             )
 
             if not isinstance(op, _allowed_op_types()):

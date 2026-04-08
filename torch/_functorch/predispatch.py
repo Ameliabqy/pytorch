@@ -20,6 +20,7 @@ from torch._C._functorch import (
     _vmap_decrement_nesting as _vmap_decrement_nesting_impl,
     _vmap_increment_nesting as _vmap_increment_nesting_impl,
 )
+from torch._VF import _make_dual as _make_dual_impl  # type: ignore[attr-defined]
 
 
 if TYPE_CHECKING:
@@ -167,3 +168,22 @@ def lazy_load_decompositions() -> None:
         _register_python_decomposition_vmap(torch.ops.aten.addr.default)
 
         DECOMPOSITIONS_LOADED = True
+
+
+def _make_dual(
+    tensor: torch.Tensor, tangent: torch.Tensor, *, level: int = 0
+) -> torch.Tensor:
+    """
+    Thin wrapper around torch._VF._make_dual that is used to proxy in
+    PT2 export/compile fx graph for forward-mode AD.
+    """
+    from torch._export.utils import _maybe_find_pre_dispatch_tf_mode_for_export
+
+    mode = _maybe_find_pre_dispatch_tf_mode_for_export()
+
+    if mode:
+        return torch.overrides.handle_torch_function(
+            _make_dual, (tensor, tangent), tensor, tangent, level=level
+        )
+
+    return _make_dual_impl(tensor, tangent, level=level)
